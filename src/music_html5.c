@@ -27,14 +27,16 @@
 
 #include <emscripten.h>
 
+#ifdef HTML5_MIXER
 #define SDL_MIXER_HTML5_DISABLE_TYPE_CHECK (SDL_TRUE)
+#else
+#define SDL_MIXER_HTML5_DISABLE_TYPE_CHECK SDL_GetHint("SDL_MIXER_HTML5_DISABLE_TYPE_CHECK")
+#endif
 
 typedef struct {
     int id;
     SDL_RWops *src;
     SDL_bool freesrc;
-    void *buf;
-    SDL_bool freebuf;
     SDL_bool playing;
 } MusicHTML5;
 
@@ -246,7 +248,7 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 if (!canPlay) {
                     const magic = buf.slice(0, 2);
                     if (magic[0] === 0xFF && (magic[1] & 0xFE) === 0xFA)
-                        canPlay = Module["SDL2Mixer"].canPlayType("audio/mp3");
+                        canPlay = Module["SDL2Mixer"].canPlayType("audio/mpeg");
                 }
 
                 return canPlay;
@@ -290,8 +292,6 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
 
 static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
 {
-    void *buf;
-    SDL_bool freebuf = SDL_FALSE;
     int id = -1;
     int size = src->size(src);
     MusicHTML5 *music = (MusicHTML5 *)SDL_calloc(1, sizeof *music);
@@ -301,36 +301,69 @@ static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
         return NULL;
     }
 
-    if (src->type == SDL_RWOPS_STDFILE) {
-        // We must make a copy of the whole file to a new buffer.
-        //
-        // Note that it's more memory-efficient for the user to call Mix_LoadMUS()
-        // instead of Mix_LoadWAV_RW(). In the former, we query FS.readFile() in JS
-        // and avoid copying memory.
+    SDL_bool force = SDL_MIXER_HTML5_DISABLE_TYPE_CHECK;
 
-        Sint64 res_size = SDL_RWsize(src);
-        void *res = malloc(res_size + 1);
+    if (src->type == SDL_RWOPS_STDFILE)
+    {
+        // This violates "private" membership, but this lets us avoid
+        // copying the entire file into a new buffer. Instead, we query
+        // FS for the file's location in MEMFS.
+        FILE *f = src->hidden.stdio.fp;
+        int fd = fileno(f);
 
-        Sint64 nb_read_total = 0, nb_read = 1;
-        buf = res;
-        while (nb_read_total < res_size && nb_read != 0) {
-            nb_read = SDL_RWread(src, buf, 1, (res_size - nb_read_total));
-            nb_read_total += nb_read;
-            buf += nb_read;
+        if (f) {
+            id = EM_ASM_INT({
+                const fd = $0;
+                const context = $1;
+                const force = $2;
+
+                const stream = SYSCALLS.getStreamFromFD(fd);
+
+                if (!stream || !stream.node || !stream.node.contents)
+                    return -1;
+
+                const buf = stream.node.contents;
+
+                let canPlay = force
+                    || Module["SDL2Mixer"].canPlayFile(stream.path)
+                    || Module["SDL2Mixer"].canPlayMagic(buf);
+
+                if (!canPlay)
+                    return -1;
+
+                const url = Module["SDL2Mixer"].createBlob(buf);
+                const id = Module["SDL2Mixer"].createMusic(url, context);
+
+                return id;
+            }, fd, music, force);
         }
-        if (nb_read_total != res_size) {
-            free(res);
-            return NULL;
-        }
-        ((char *)res)[nb_read_total] = '\0';
-
-        // Reset buf pointer back to start of memory for re-use
-        buf = res;
-        freebuf = SDL_TRUE;
-    } else if (src->type == SDL_RWOPS_MEMORY || src->type == SDL_RWOPS_MEMORY_RO)
+    }
+    else if (src->type == SDL_RWOPS_MEMORY || src->type == SDL_RWOPS_MEMORY_RO)
+    {
         // This violates "private" membership, but it works because
         // the entire file is loaded in this pointer.
-        buf = src->hidden.mem.base;
+        void *buf = src->hidden.mem.base;
+
+        if (buf && size > 0)
+        {
+            id = EM_ASM_INT({
+                const ptr = $0;
+                const size = $1;
+                const context = $2;
+                const force = $3;
+
+                const buf = new Uint8Array(Module.HEAPU8.buffer, ptr, size);
+
+                if (!force && !Module["SDL2Mixer"].canPlayMagic(buf))
+                    return -1;
+
+                const url = Module["SDL2Mixer"].createBlob(buf);
+                const id = Module["SDL2Mixer"].createMusic(url, context);
+
+                return id;
+            }, buf, size, music, force);
+        }
+    } 
     else
     {
         Mix_SetError("Unsupported RWops type: %d", src->type);
@@ -339,31 +372,8 @@ static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
         return NULL;
     }
 
-    if (buf && size > 0)
-    {
-        SDL_bool force = SDL_MIXER_HTML5_DISABLE_TYPE_CHECK;
-        id = EM_ASM_INT({
-            const ptr = $0;
-            const size = $1;
-            const context = $2;
-            const force = $3;
-
-            const buf = new Uint8Array(Module.HEAPU8.buffer, ptr, size);
-
-            if (!force && !Module["SDL2Mixer"].canPlayMagic(buf))
-                return -1;
-
-            const url = Module["SDL2Mixer"].createBlob(buf);
-            const id = Module["SDL2Mixer"].createMusic(url, context);
-
-            return id;
-        }, buf, size, music, force);
-    }
-
     if (id == -1)
     {
-        if (freebuf)
-            SDL_free(buf);
         SDL_free(music);
         return NULL;
     }
@@ -372,8 +382,6 @@ static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
     music->id = id;
     music->src = src;
     music->freesrc = freesrc;
-    music->buf = buf;
-    music->freebuf = SDL_TRUE;
     music->playing = SDL_TRUE;
 
     /* We're done */
@@ -432,7 +440,6 @@ static void *MusicHTML5_CreateFromFile(const char *file)
     /* Fill the music structure */
     music->id = id;
     music->freesrc = SDL_FALSE;
-    music->freebuf = SDL_FALSE;
     music->playing = SDL_TRUE;
 
     /* We're done */
@@ -598,8 +605,6 @@ static void MusicHTML5_Delete(void *context)
 
     if (music->freesrc && music->src)
         SDL_RWclose(music->src);
-    if (music->freebuf && music->buf)
-        SDL_free(music->buf);
 
     SDL_free(music);
 }
