@@ -9,14 +9,11 @@ that performs all sound decoding in WASM. It pushes samples via [`emscripten-por
 to a [Web Audio](https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API) context for playback.
 
 While this approach ensures the highest parity with native builds, the program is susceptible to
-dropped samples and playback stutters because [`emscripten-ports/SDL2`](https://github.com/emscripten-ports/SDL2_mixer)
-uses [`ScriptProcessorNode`](https://developer.mozilla.org/en-US/docs/Web/API/ScriptProcessorNode)
-to render samples. Both this and music decoding occur  in the main thread.
+dropped samples and playback stutters because music decoding and audio rendering both occur in the main thread.
 
 To reduce processing load, we implement the `SDL2_mixer` interface to use the browser's native
 playback features via
-[`<audio>`](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/audio) and its constructor
-[`Audio()`](https://developer.mozilla.org/en-US/docs/Web/API/HTMLAudioElement/Audio).
+[`<audio>`](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/audio).
 
 ## How to Use
 
@@ -43,7 +40,7 @@ for progress.
 
 ## Potential Steps
 
-* Render sound channels with [`AudioWorklet`](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet).
+* Migrate SDL2's sound channel rendering from [`ScriptProcessorNode`](https://developer.mozilla.org/en-US/docs/Web/API/ScriptProcessorNode) to [`AudioWorklet`](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet).
 * Render music via `AudioContext.decodeAudioData()`. See [WebAudio/web-audio-api#1850](https://github.com/WebAudio/web-audio-api/issues/1850).
 
 ## See Also

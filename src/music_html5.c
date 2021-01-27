@@ -27,10 +27,15 @@
 
 #include <emscripten.h>
 
+#define SDL_MIXER_HTML5_DISABLE_TYPE_CHECK (SDL_TRUE)
+
 typedef struct {
     int id;
     SDL_RWops *src;
     SDL_bool freesrc;
+    void *buf;
+    SDL_bool freebuf;
+    SDL_bool playing;
 } MusicHTML5;
 
 static SDL_bool html5_opened(void)
@@ -38,6 +43,20 @@ static SDL_bool html5_opened(void)
     return EM_ASM_INT({
         return !!Module["SDL2Mixer"] && !!Module["SDL2Mixer"].music;
     });
+}
+
+static void html5_handle_music_stopped(void *context)
+{
+    // Sets music->playing to FALSE. Call "finished" handler explicitly
+    // in devappd/html5_mixer which does not run its own sound loop.
+
+    MusicHTML5 *music = (MusicHTML5 *)context;
+    if (music)
+        music->playing = SDL_FALSE;
+
+#ifdef HTML5_MIXER
+    run_music_finished_hook();
+#endif
 }
 
 static int MusicHTML5_Open(const SDL_AudioSpec *spec)
@@ -48,6 +67,8 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
         return 0;
 
     EM_ASM(({
+        const wasmMusicStopped = $0;
+
         Module["SDL2Mixer"] = {
             blob: {
                 // URL.createObjectURL(...): numUses (int)
@@ -55,6 +76,41 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
 
             music: {
                 // randomId: new Audio(file);
+            },
+
+            createBlob: function(buf) {
+                const blob = new Blob([buf], { type: "octet/stream" });
+                const url = URL.createObjectURL(blob);
+
+                // TODO: Match blob by ptr and size so we don't duplicate
+
+                if (!(url in this.blob))
+                    this.blob[url] = 0;
+                this.blob[url]++;
+
+                return url;
+            },
+
+            deleteBlob: function(url) {
+                if (url in this.blob && --this.blob[url] <= 0) {
+                    URL.revokeObjectURL(url);
+                    delete this.blob[url];
+                }
+            },
+
+            createMusic: function(url, context) {
+                const id = this.getNewId();
+                this.music[id] = new Audio(url);
+                this.music[id].addEventListener("ended", this.musicFinished, false);
+                this.music[id].addEventListener("error", this.musicError, false);
+                this.music[id].addEventListener("abort", this.musicInterrupted, false);
+                // Can browser recover from these states? If not, consider enabling these
+                // as well as the corresponding removeEventListeners in deleteMusic().
+                //this.music[id].addEventListener("stalled", this.musicInterrupted, false);
+                //this.music[id].addEventListener("suspend", this.musicInterrupted, false);
+                if (context)
+                    this.music[id].dataset.context = context;
+                return id;
             },
 
             deleteMusic: function(id) {
@@ -68,16 +124,29 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 this.music[id].load();
                 this.music[id].remove();
 
+                this.music[id].removeEventListener("ended", this.musicFinished, false);
+                this.music[id].removeEventListener("error", this.musicError, false);
+                this.music[id].removeEventListener("abort", this.musicInterrupted, false);
+                //this.music[id].removeEventListener("stalled", this.musicInterrupted, false);
+                //this.music[id].removeEventListener("suspend", this.musicInterrupted, false);
+
                 delete this.music[id];
 
                 this.deleteBlob(url);
             },
 
-            deleteBlob: function(url) {
-                if (url in this.blob && --this.blob[url] <= 0) {
-                    URL.revokeObjectURL(url);
-                    delete this.blob[url];
+            resetMusicState: function(audio) {
+                let context = 0;
+
+                if (audio instanceof HTMLMediaElement) {
+                    audio.pause();
+                    audio.dataset.playCount = 0;
+                    audio.currentTime = 0;
+                    audio.loop = false;
+                    context = parseInt(audio.dataset.context);
                 }
+
+                dynCall("vi", wasmMusicStopped, [context]);
             },
 
             getNewId: function() {
@@ -106,7 +175,9 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                     m4a: 'audio/mp4',
                     aif: 'audio/x-aiff',
                     webm: 'audio/webm',
-                    adts: 'audio/aac'
+                    adts: 'audio/aac',
+                    mkv: 'video/x-matroska',
+                    mka: 'audio/x-matroska'
                 };
 
                 // Get any <audio>, doesn't matter which
@@ -120,7 +191,7 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 if(!audio)
                     audio = this.music[0] = new Audio();
 
-                return audio.canPlayType(formats[type] || type);
+                return !!audio.canPlayType(formats[type] || type);
             },
 
             canPlayFile: function(file) {
@@ -129,6 +200,56 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                     return this.canPlayType(type);
                 else // Fail without Exception
                     return false;
+            },
+
+            canPlayMagic: function(buf) {
+                let canPlay;
+
+                const targets = [
+                    { type: "audio/ogg", magic: [0x4f, 0x67, 0x67, 0x53] },  // OggS
+                    { type: "audio/flac", magic: [0x66, 0x4c, 0x61, 0x43] }, // fLaC
+                    //{ type: "audio/midi", magic: [0x4d, 0x54, 0x68, 0x64] }, // MThd
+                    { type: "audio/mpeg", magic: [0x49, 0x44, 0x33] },        // ID3
+                    { type: "audio/wav", magic: [0x52, 0x49, 0x46, 0x46] },
+                    { type: "audio/mp4", offset: 4, magic: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D] },
+                    { type: "audio/mp4", offset: 4, magic: [0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x41, 0x20] },
+                    { type: "audio/x-aiff", magic: [0x46, 0x4F, 0x52, 0x4D] },
+                    { type: ["audio/webm", "audio/x-matroska"], magic: [0x1A, 0x45, 0xDF, 0xA3] }
+                ];
+                
+                targets.some((target) => {
+                    const targetMagic = target.magic;
+                    const magicLength = targetMagic.length;
+                    const offset = target.offset || 0;
+                    const magic = buf.slice(offset, offset + magicLength);
+
+                    let matching = true;
+                    for (let i = 0; i < magicLength; i++) {
+                        if (magic[i] !== targetMagic[i]) {
+                            matching = false;
+                            break;
+                        }
+                    }
+
+                    if (matching) {
+                        const targetTypes = Array.isArray(target.type) ? target.type : [target.type];
+                        targetTypes.some((targetType) => {
+                            canPlay = Module["SDL2Mixer"].canPlayType(targetType);
+                            if (canPlay)
+                                return true;
+                        });
+                        return true;
+                    }
+                });
+
+                // MP3 special case
+                if (!canPlay) {
+                    const magic = buf.slice(0, 2);
+                    if (magic[0] === 0xFF && (magic[1] & 0xFE) === 0xFA)
+                        canPlay = Module["SDL2Mixer"].canPlayType("audio/mp3");
+                }
+
+                return canPlay;
             },
 
             musicFinished: function(e) {
@@ -143,14 +264,8 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 if (--audio.dataset.playCount > 0) {
                     audio.currentTime = 0;
                     audio.play();
-                } else {
-                    audio.dataset.playCount = 0;
-                    audio.currentTime = 0;
-                    audio.loop = false;
-
-                    // Signal `true` to run hookMusicFinished
-                    return true;
-                }
+                } else
+                    Module["SDL2Mixer"].resetMusicState(audio);
             },
 
             musicError: function(e) {
@@ -159,29 +274,16 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 if (!(audio instanceof HTMLMediaElement))
                     return;
 
-                console.error("Error " + audio.error.code + "; details: " + audio.error.message);
+                Module["printErr"]("Error " + audio.error.code + "; details: " + audio.error.message);
 
-                // Reset to defaults
-                audio.pause();
-                audio.dataset.playCount = 0;
-                audio.currentTime = 0;
-                audio.loop = false;
+                Module["SDL2Mixer"].resetMusicState(audio);
+            },
+
+            musicInterrupted: function(e) {
+                Module["SDL2Mixer"].resetMusicState(e.target);
             }
         };
-    }));
-
-#ifdef HTML5_MIXER
-    // HookMusicFinished support for html5_mixer (a minimal implementation of SDL2_mixer)
-    EM_ASM({
-        const hookMusicFinished = $0;
-        Module["SDL2Mixer"].musicFinished = function(predefined) {
-            return function(e) {
-                if (predefined(e))
-                    dynCall("v", hookMusicFinished, []);
-            }
-        }(Module["SDL2Mixer"].musicFinished);
-    }, run_music_finished_hook);
-#endif
+    }), html5_handle_music_stopped);
 
     return 0;
 }
@@ -189,58 +291,90 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
 static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
 {
     void *buf;
+    SDL_bool freebuf = SDL_FALSE;
     int id = -1;
     int size = src->size(src);
-    MusicHTML5 *music;
+    MusicHTML5 *music = (MusicHTML5 *)SDL_calloc(1, sizeof *music);
 
-    if (src->type == SDL_RWOPS_STDFILE)
-        buf = src->hidden.stdio.fp;
-    else if (src->type == SDL_RWOPS_MEMORY || src->type == SDL_RWOPS_MEMORY_RO)
+    if (music == NULL) {
+        Mix_SetError("Out of memory");
+        return NULL;
+    }
+
+    if (src->type == SDL_RWOPS_STDFILE) {
+        // We must make a copy of the whole file to a new buffer.
+        //
+        // Note that it's more memory-efficient for the user to call Mix_LoadMUS()
+        // instead of Mix_LoadWAV_RW(). In the former, we query FS.readFile() in JS
+        // and avoid copying memory.
+
+        Sint64 res_size = SDL_RWsize(src);
+        void *res = malloc(res_size + 1);
+
+        Sint64 nb_read_total = 0, nb_read = 1;
+        buf = res;
+        while (nb_read_total < res_size && nb_read != 0) {
+            nb_read = SDL_RWread(src, buf, 1, (res_size - nb_read_total));
+            nb_read_total += nb_read;
+            buf += nb_read;
+        }
+        if (nb_read_total != res_size) {
+            free(res);
+            return NULL;
+        }
+        ((char *)res)[nb_read_total] = '\0';
+
+        // Reset buf pointer back to start of memory for re-use
+        buf = res;
+        freebuf = SDL_TRUE;
+    } else if (src->type == SDL_RWOPS_MEMORY || src->type == SDL_RWOPS_MEMORY_RO)
+        // This violates "private" membership, but it works because
+        // the entire file is loaded in this pointer.
         buf = src->hidden.mem.base;
     else
     {
         Mix_SetError("Unsupported RWops type: %d", src->type);
         if (freesrc)
-            src->close(src);
+            SDL_RWclose(src);
         return NULL;
     }
 
     if (buf && size > 0)
     {
+        SDL_bool force = SDL_MIXER_HTML5_DISABLE_TYPE_CHECK;
         id = EM_ASM_INT({
             const ptr = $0;
             const size = $1;
+            const context = $2;
+            const force = $3;
 
-            const arr = new Uint8Array(Module.HEAPU8.buffer, ptr, size);
-            const blob = new Blob([arr], { type: "octet/stream" });
-            const url = URL.createObjectURL(blob);
+            const buf = new Uint8Array(Module.HEAPU8.buffer, ptr, size);
 
-            // TODO: Match blob by ptr and size so we don't duplicate
+            if (!force && !Module["SDL2Mixer"].canPlayMagic(buf))
+                return -1;
 
-            if (!(url in Module["SDL2Mixer"].blob))
-                Module["SDL2Mixer"].blob[url] = 0;
-            Module["SDL2Mixer"].blob[url]++;
+            const url = Module["SDL2Mixer"].createBlob(buf);
+            const id = Module["SDL2Mixer"].createMusic(url, context);
 
-            const id = Module["SDL2Mixer"].getNewId();
-            Module["SDL2Mixer"].music[id] = new Audio(url);
-            Module["SDL2Mixer"].music[id].addEventListener("ended", Module["SDL2Mixer"].musicFinished, false);
-            Module["SDL2Mixer"].music[id].addEventListener("error", Module["SDL2Mixer"].musicError, false);
             return id;
-        }, buf, size);
+        }, buf, size, music, force);
     }
 
     if (id == -1)
-        return NULL;
-
-    /* Allocate and fill the music structure */
-    music = (MusicHTML5 *)SDL_calloc(1, sizeof *music);
-    if (music == NULL) {
-        Mix_SetError("Out of memory");
+    {
+        if (freebuf)
+            SDL_free(buf);
+        SDL_free(music);
         return NULL;
     }
+
+    /* Fill the music structure */
     music->id = id;
     music->src = src;
     music->freesrc = freesrc;
+    music->buf = buf;
+    music->freebuf = SDL_TRUE;
+    music->playing = SDL_TRUE;
 
     /* We're done */
     return music;
@@ -249,94 +383,57 @@ static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
 /* Load a music stream from the given file */
 static void *MusicHTML5_CreateFromFile(const char *file)
 {
-    MusicHTML5 *music;
+    MusicHTML5 *music = (MusicHTML5 *)SDL_calloc(1, sizeof *music);;
     int id = -1;
+    SDL_bool force = SDL_MIXER_HTML5_DISABLE_TYPE_CHECK;
 
-    SDL_RWops *src = SDL_RWFromFile(file, "rb");
-    if (src != NULL)
-    {
-#ifdef HTML5_MIXER
-        // Just pass the entire path; we don't bundle detect_music_type()
-        const char *fileType = file;
-#else
-        Mix_MusicType type = detect_music_type(src);
-        
-        char *fileType;
-        switch(type) {
-            case MUS_OGG:
-                fileType = "ogg";
-                break;
-
-            case MUS_FLAC:
-                fileType = "flac";
-                break;
-
-            case MUS_MP3:
-                fileType = "mp3";
-                break;
-
-            default:
-                fileType = file;
-                break;
-        }
-#endif
-
-        SDL_bool canPlay = EM_ASM_INT({
-            const file = UTF8ToString($0);
-            return Module["SDL2Mixer"].canPlayFile(file);
-        }, file);
-
-        if (canPlay)
-            return MusicHTML5_CreateFromRW(src, SDL_TRUE);
-        else
-        {
-            Mix_SetError("Format is not supported by HTML5 <audio>");
-            src->close(src);
-            return NULL;
-        }
-    }
-    else
-    {
-        // Assume it's a URL
-        id = EM_ASM_INT({
-            function isValidUrl(string) {
-                let url;
-                
-                try {
-                    url = new URL(string);
-                } catch (_) {
-                    return false;  
-                }
-
-                return url.protocol === "http:" || url.protocol === "https:";
-            }
-
-            const url = UTF8ToString($0);
-
-            if (!isValidUrl) {
-                console.error(`URL ${url} is invalid`);
-                return -1;
-            }
-
-            const id = Module["SDL2Mixer"].getNewId();
-            Module["SDL2Mixer"].music[id] = new Audio(url);
-            Module["SDL2Mixer"].music[id].addEventListener("ended", Module["SDL2Mixer"].musicFinished, false);
-            Module["SDL2Mixer"].music[id].addEventListener("error", Module["SDL2Mixer"].musicError, false);
-            return id;
-        }, file);
-    }
-
-    if (id == -1)
-        return NULL;
-
-    /* Allocate and fill the music structure */
-    music = (MusicHTML5 *)SDL_calloc(1, sizeof *music);
     if (music == NULL) {
         Mix_SetError("Out of memory");
         return NULL;
     }
+
+    id = EM_ASM_INT({
+        const file = UTF8ToString($0);
+        const context = $1;
+        const force = $2;
+
+        let url;
+        try {
+            // Is path in FS?
+            const buf = FS.readFile(file);
+            url = Module["SDL2Mixer"].createBlob(buf);
+
+            let canPlay = force || Module["SDL2Mixer"].canPlayFile(file);
+
+            if (!canPlay)
+                canPlay = Module["SDL2Mixer"].canPlayMagic(buf);
+
+            if (!canPlay)
+                return -1;
+        } catch(e) {
+            // Fail silently, presume file not in FS.
+            // Assume it's a relative or absolute URL
+            url = file;
+
+            // Check audio capability by file extension
+            if (!force && !Module["SDL2Mixer"].canPlayFile(url))
+                return -1;
+        }
+
+        const id = Module["SDL2Mixer"].createMusic(url, context);
+        return id;
+    }, file, music, force);
+
+    if (id == -1) {
+        SDL_free(music);
+        return NULL;
+    }
+
+    /* Fill the music structure */
     music->id = id;
     music->freesrc = SDL_FALSE;
+    music->freebuf = SDL_FALSE;
+    music->playing = SDL_TRUE;
 
     /* We're done */
     return music;
@@ -385,9 +482,9 @@ static int MusicHTML5_Play(void *context, int play_count)
 
             // Older browsers do not return a Promise
             if (played)
-                played.catch((e) => console.error(e));
+                played.catch((e) => Module["printErr"](e));
         } catch (e) {
-            console.error(e);
+            Module["printErr"](e);
             return -1;
         }
         return 0;
@@ -404,15 +501,39 @@ static SDL_bool MusicHTML5_IsPlaying(void *context)
 {
     MusicHTML5 *music = (MusicHTML5 *)context;
     
-    return EM_ASM_INT({
+    if (!music) {
+        // Call "finished" handler in devappd/html5_mixer
+        html5_handle_music_stopped(context);
+        return SDL_FALSE;
+    }
+
+    // We track a music->playing variable to play nice with music_mixer()'s
+    // IsPlaying() check on every frame. E.g., the check will run when
+    // <audio> is buffering and the music is technically not "playing".
+    // Ergo, the HookMusicFinished() callback is called immediately when
+    // the <audio> has not even begun playback.
+    //
+    // To resolve this, we rely on JavaScript callbacks to reset the
+    // music->playing status on end, on error, etc.
+
+    int safeStatus = EM_ASM_INT({
         const id = $0;
-        return  Module["SDL2Mixer"].music[id]
-            &&  Module["SDL2Mixer"].music[id].currentTime > 0
+        const safeStatus =
+            Module["SDL2Mixer"].music[id]
+            && !Module["SDL2Mixer"].music[id].ended
             // SDL Mixer considers "paused" music as "playing"
             //&& !Module["SDL2Mixer"].music[id].paused
-            && !Module["SDL2Mixer"].music[id].ended
-            &&  Module["SDL2Mixer"].music[id].readyState > 2;
+            // These conditions interfere with the "playing" check
+            //&&  Module["SDL2Mixer"].music[id].readyState > 2;
+            //&&  Module["SDL2Mixer"].music[id].currentTime > 0
+            ;
+
+        if (!safeStatus)
+            // Reset JS state and falsify music->playing
+            Module["SDL2Mixer"].resetMusicState(Module["SDL2Mixer"].music[id]);
     }, music->id);
+
+    return music->playing;
 }
 
 /* Jump (seek) to a given position (time is in seconds) */
@@ -458,11 +579,7 @@ static void MusicHTML5_Stop(void *context)
 
     EM_ASM({
         const id = $0;
-
-        Module["SDL2Mixer"].music[id].pause();
-        Module["SDL2Mixer"].music[id].dataset.playCount = 0;
-        Module["SDL2Mixer"].music[id].currentTime = 0;
-        Module["SDL2Mixer"].music[id].loop = false;
+        Module["SDL2Mixer"].resetMusicState(Module["SDL2Mixer"].music[id]);
     }, music->id);
 }
 
@@ -481,6 +598,8 @@ static void MusicHTML5_Delete(void *context)
 
     if (music->freesrc && music->src)
         SDL_RWclose(music->src);
+    if (music->freebuf && music->buf)
+        SDL_free(music->buf);
 
     SDL_free(music);
 }
