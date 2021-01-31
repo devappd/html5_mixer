@@ -38,10 +38,15 @@ Your audio files must be supported by the user's web browser. For a format compa
 Currently, we support a minimal subset of the `SDL2_mixer` API. See [issue #1](https://github.com/devappd/html5_mixer/issues/1)
 for progress.
 
-## Potential Steps
+## Potential Next Steps
 
 * Migrate SDL2's sound channel rendering from [`ScriptProcessorNode`](https://developer.mozilla.org/en-US/docs/Web/API/ScriptProcessorNode) to [`AudioWorklet`](https://developer.mozilla.org/en-US/docs/Web/API/AudioWorklet).
-* Render music via `AudioContext.decodeAudioData()`. See [WebAudio/web-audio-api#1850](https://github.com/WebAudio/web-audio-api/issues/1850).
+* Render music via `AudioContext.decodeAudioData()`. See:
+    * [WebAudio/web-audio-api#1850](https://github.com/WebAudio/web-audio-api/issues/1850) -- SharedArrayBuffer source
+    * [WebAudio/web-audio-api#337](https://github.com/WebAudio/web-audio-api/issues/337) -- Streaming partial content
+    * [WebAudio/web-audio-api-v2#61](https://github.com/WebAudio/web-audio-api-v2/issues/61) -- Using WebCodec
+    * [AnthumChris/fetch-stream-audio](https://github.com/AnthumChris/fetch-stream-audio)
+    * [StackOverflow](https://stackoverflow.com/a/49386457)
 
 ## See Also
 

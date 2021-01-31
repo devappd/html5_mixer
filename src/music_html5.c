@@ -28,9 +28,22 @@
 #include <emscripten.h>
 
 #ifdef HTML5_MIXER
+// html5_mixer is a minimal implementation of SDL Mixer that supports
+// only the HTML5 <audio> output.
+//
+// See https://github.com/devappd/html5_mixer
+
 #define SDL_MIXER_HTML5_DISABLE_TYPE_CHECK (SDL_TRUE)
+
+#ifdef HTML5_MIXER_ALLOW_AUTOPLAY
+#define SDL_MIXER_HTML5_ALLOW_AUTOPLAY (SDL_TRUE)
 #else
-#define SDL_MIXER_HTML5_DISABLE_TYPE_CHECK SDL_GetHint("SDL_MIXER_HTML5_DISABLE_TYPE_CHECK")
+#define SDL_MIXER_HTML5_ALLOW_AUTOPLAY (SDL_FALSE)
+#endif
+
+#else
+#define SDL_MIXER_HTML5_DISABLE_TYPE_CHECK (SDL_GetHint("SDL_MIXER_HTML5_DISABLE_TYPE_CHECK") ? SDL_TRUE : SDL_FALSE)
+#define SDL_MIXER_HTML5_ALLOW_AUTOPLAY (SDL_GetHint("SDL_MIXER_HTML5_ALLOW_AUTOPLAY") ? SDL_TRUE : SDL_FALSE)
 #endif
 
 typedef struct {
@@ -70,18 +83,112 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
 
     EM_ASM(({
         const wasmMusicStopped = $0;
+        const allowAutoplay = $1;
 
         Module["SDL2Mixer"] = {
+            ////////////////////////////////////////////////////////////
+            // Data
+            ////////////////////////////////////////////////////////////
+
+            player: new Audio(),
+
             blob: {
                 // URL.createObjectURL(...): numUses (int)
             },
 
             music: {
-                // randomId: new Audio(file);
+                // randomId: {
+                //     src: (str),
+                //     context: (int),
+                //     playCount: (int),
+                //     volume: (int)
+                // };
             },
 
+            ////////////////////////////////////////////////////////////
+            // player <-> music management
+            ////////////////////////////////////////////////////////////
+
+            setPlayerProperty: function (id, property, value) {
+                this.music[id][property] = value;
+                if (this.player.dataset.currentId == id)
+                    this.player[property] = value;
+            },
+
+            setPlayerDatasetProperty: function (id, property, value) {
+                // music objects do not differentiate dataset fields
+                this.music[id][property] = value;
+                if (this.player.dataset.currentId == id)
+                    this.player.dataset[property] = value;
+            },
+
+            setPlayerVolume: function(id, volume) {
+                this.setPlayerProperty(id, "volume", volume);
+            },
+
+            setPlayerLoop: function(id, loop) {
+                this.setPlayerProperty(id, "loop", loop);
+            },
+
+            setPlayerCurrentTime: function(id, currentTime) {
+                this.setPlayerProperty(id, "currentTime", currentTime);
+            },
+
+            setPlayerPlayCount: function(id, playCount) {
+                this.setPlayerDatasetProperty(id, "playCount", playCount);
+            },
+
+            startPlayer: function(id) {
+                if (this.player.dataset.currentId != id) {
+                    if ("volume" in this.music[id])
+                        this.player.volume = this.music[id].volume;
+                    this.player.dataset.currentId = id;
+                    // Don't do this in iOS until the first activation
+                    if (this.player.dataset.activated) {
+                        this.player.src = this.music[id].src;
+                        this.player.load();
+                    }
+                }
+                return this.playPlayer(id);
+            },
+
+            playPlayer: function(id) {
+                if (this.player.dataset.currentId == id
+                    // For iOS autoplay requirements. This check is not
+                    // necessary for Chrome/Firefox, but do it anyway
+                    // for parity.
+                    && (allowAutoplay || this.player.dataset.activated)
+                )
+                    return this.player.play();
+            },
+
+            pausePlayer: function(id) {
+                if (this.player.dataset.currentId == id)
+                    this.player.pause();
+            },
+
+            resetMusicState: function(id) {
+                let context = 0;
+
+                if (id && this.music[id]) {
+                    this.pausePlayer(id);
+                    this.setPlayerPlayCount(id, 0);
+                    this.setPlayerCurrentTime(id, 0);
+                    this.setPlayerLoop(id, false);
+                    if (this.music[id].context)
+                        context = this.music[id].context;
+                }
+
+                wasmTable.get(wasmMusicStopped)(context);
+            },
+
+            ////////////////////////////////////////////////////////////
+            // Data Management
+            ////////////////////////////////////////////////////////////
+
             createBlob: function(buf) {
-                const blob = new Blob([buf], { type: "octet/stream" });
+                const type = this.getTypeFromMagic(buf);
+                const blob = new Blob([buf], { type: type ? type : "octet/stream" });
                 const url = URL.createObjectURL(blob);
 
                 // TODO: Match blob by ptr and size so we don't duplicate
@@ -102,57 +209,24 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
 
             createMusic: function(url, context) {
                 const id = this.getNewId();
-                this.music[id] = new Audio(url);
-                this.music[id].addEventListener("ended", this.musicFinished, false);
-                this.music[id].addEventListener("error", this.musicError, false);
-                this.music[id].addEventListener("abort", this.musicInterrupted, false);
-                // Can browser recover from these states? If not, consider enabling these
-                // as well as the corresponding removeEventListeners in deleteMusic().
-                //this.music[id].addEventListener("stalled", this.musicInterrupted, false);
-                //this.music[id].addEventListener("suspend", this.musicInterrupted, false);
+                this.music[id] = {
+                    src: url
+                };
                 if (context)
-                    this.music[id].dataset.context = context;
+                    this.music[id].context = context;
                 return id;
             },
 
             deleteMusic: function(id) {
                 if (!(id in this.music))
                     return;
-
-                const url = this.music[id].currentSrc;
-
-                this.music[id].pause();
-                this.music[id].removeAttribute("src");
-                this.music[id].load();
-                this.music[id].remove();
-
-                this.music[id].removeEventListener("ended", this.musicFinished, false);
-                this.music[id].removeEventListener("error", this.musicError, false);
-                this.music[id].removeEventListener("abort", this.musicInterrupted, false);
-                //this.music[id].removeEventListener("stalled", this.musicInterrupted, false);
-                //this.music[id].removeEventListener("suspend", this.musicInterrupted, false);
-
+                this.resetMusicState(id);
+                this.deleteBlob(this.music[id].src);
                 delete this.music[id];
-
-                this.deleteBlob(url);
-            },
-
-            resetMusicState: function(audio) {
-                let context = 0;
-
-                if (audio instanceof HTMLMediaElement) {
-                    audio.pause();
-                    audio.dataset.playCount = 0;
-                    audio.currentTime = 0;
-                    audio.loop = false;
-                    context = parseInt(audio.dataset.context);
-                }
-
-                dynCall("vi", wasmMusicStopped, [context]);
             },
 
             getNewId: function() {
-                const min = 0;
+                const min = 1;
                 const max = 2147483647; // INT32_MAX
 
                 // Guard against collisions
@@ -165,8 +239,6 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
             },
 
             canPlayType: function(type) {
-                let audio;
-
                 // Allow user to create shortcuts, i.e. just "mp3"
                 const formats = {
                     mp3: 'audio/mpeg',
@@ -182,18 +254,7 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                     mka: 'audio/x-matroska'
                 };
 
-                // Get any <audio>, doesn't matter which
-                for (const prop in this.music) {
-                    if (this.music[prop] instanceof HTMLMediaElement) {
-                        audio = this.music[prop];
-                        break;
-                    }
-                }
-
-                if(!audio)
-                    audio = this.music[0] = new Audio();
-
-                return !!audio.canPlayType(formats[type] || type);
+                return !!this.player.canPlayType(formats[type] || type);
             },
 
             canPlayFile: function(file) {
@@ -204,8 +265,8 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                     return false;
             },
 
-            canPlayMagic: function(buf) {
-                let canPlay;
+            getTypeFromMagic: function(buf) {
+                let result = null;
 
                 const targets = [
                     { type: "audio/ogg", magic: [0x4f, 0x67, 0x67, 0x53] },  // OggS
@@ -216,7 +277,7 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                     { type: "audio/mp4", offset: 4, magic: [0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D] },
                     { type: "audio/mp4", offset: 4, magic: [0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x41, 0x20] },
                     { type: "audio/x-aiff", magic: [0x46, 0x4F, 0x52, 0x4D] },
-                    { type: ["audio/webm", "audio/x-matroska"], magic: [0x1A, 0x45, 0xDF, 0xA3] }
+                    { type: "audio/webm", magic: [0x1A, 0x45, 0xDF, 0xA3] }
                 ];
                 
                 targets.some((target) => {
@@ -234,28 +295,32 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                     }
 
                     if (matching) {
-                        const targetTypes = Array.isArray(target.type) ? target.type : [target.type];
-                        targetTypes.some((targetType) => {
-                            canPlay = Module["SDL2Mixer"].canPlayType(targetType);
-                            if (canPlay)
-                                return true;
-                        });
+                        result = target.type;
                         return true;
                     }
                 });
 
                 // MP3 special case
-                if (!canPlay) {
+                if (!result) {
                     const magic = buf.slice(0, 2);
                     if (magic[0] === 0xFF && (magic[1] & 0xFE) === 0xFA)
-                        canPlay = Module["SDL2Mixer"].canPlayType("audio/mpeg");
+                        result = "audio/mpeg";
                 }
 
-                return canPlay;
+                return result;
             },
+
+            canPlayMagic: function(buf) {
+                return this.canPlayType(this.getTypeFromMagic(buf));
+            },
+
+            ////////////////////////////////////////////////////////////
+            // Events
+            ////////////////////////////////////////////////////////////
 
             musicFinished: function(e) {
                 const audio = e.target;
+                const id = audio.dataset.currentId;
 
                 if (!(audio instanceof HTMLMediaElement))
                     return;
@@ -263,11 +328,14 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 // if playCount == -1, then audio.loop is true and the
                 // "ended" event is not fired (i.e., we never reach this function.)
 
-                if (--audio.dataset.playCount > 0) {
+                const playCount = audio.dataset.playCount - 1;
+                Module["SDL2Mixer"].setPlayerPlayCount(id, playCount);
+
+                if (playCount > 0) {
                     audio.currentTime = 0;
                     audio.play();
                 } else
-                    Module["SDL2Mixer"].resetMusicState(audio);
+                    Module["SDL2Mixer"].resetMusicState(id);
             },
 
             musicError: function(e) {
@@ -276,16 +344,48 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
                 if (!(audio instanceof HTMLMediaElement))
                     return;
 
-                Module["printErr"]("Error " + audio.error.code + "; details: " + audio.error.message);
+                err("Error " + audio.error.code + "; details: " + audio.error.message);
 
-                Module["SDL2Mixer"].resetMusicState(audio);
+                Module["SDL2Mixer"].resetMusicState(audio.dataset.currentId);
             },
 
             musicInterrupted: function(e) {
-                Module["SDL2Mixer"].resetMusicState(e.target);
+                Module["SDL2Mixer"].resetMusicState(e.target.dataset.currentId);
             }
         };
-    }), html5_handle_music_stopped);
+
+        Module["SDL2Mixer"].player.addEventListener("ended", Module["SDL2Mixer"].musicFinished, false);
+        Module["SDL2Mixer"].player.addEventListener("error", Module["SDL2Mixer"].musicError, false);
+        Module["SDL2Mixer"].player.addEventListener("abort", Module["SDL2Mixer"].musicInterrupted, false);
+        // Can browser recover from these states? If not, consider enabling these
+        // as well as the corresponding removeEventListeners in deleteMusic().
+        //Module["SDL2Mixer"].player.addEventListener("stalled", Module["SDL2Mixer"].musicInterrupted, false);
+        //Module["SDL2Mixer"].player.addEventListener("suspend", Module["SDL2Mixer"].musicInterrupted, false);
+
+        // Satisfy iOS input requirement for autoplay.
+        // Based on https://github.com/emscripten-core/emscripten/pull/10843
+        ["keydown","mousedown","touchstart"].forEach(function(event) {
+            [document, document.getElementById("canvas")].forEach(function (element) {
+                if (element)
+                    element.addEventListener(event, function () {
+                        if (Module["SDL2Mixer"] 
+                            && Module["SDL2Mixer"].player 
+                            && !Module["SDL2Mixer"].player.dataset.activated
+                        ) {
+                            if (Module["SDL2Mixer"].player.dataset.currentId) {
+                                const id = parseInt(Module["SDL2Mixer"].player.dataset.currentId);
+                                if (Module["SDL2Mixer"].music[id]) {
+                                    Module["SDL2Mixer"].player.src = Module["SDL2Mixer"].music[id].src;
+                                    Module["SDL2Mixer"].player.load();
+                                }
+                            }
+                            Module["SDL2Mixer"].player.play();
+                            Module["SDL2Mixer"].player.dataset.activated = true;
+                        }
+                    }, { once: true });
+            });
+        });
+    }), html5_handle_music_stopped, SDL_MIXER_HTML5_ALLOW_AUTOPLAY);
 
     return 0;
 }
@@ -324,7 +424,7 @@ static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
 
                 const buf = stream.node.contents;
 
-                let canPlay = force
+                const canPlay = force
                     || Module["SDL2Mixer"].canPlayFile(stream.path)
                     || Module["SDL2Mixer"].canPlayMagic(buf);
 
@@ -354,7 +454,9 @@ static void *MusicHTML5_CreateFromRW(SDL_RWops *src, int freesrc)
 
                 const buf = new Uint8Array(Module.HEAPU8.buffer, ptr, size);
 
-                if (!force && !Module["SDL2Mixer"].canPlayMagic(buf))
+                const canPlay = force || Module["SDL2Mixer"].canPlayMagic(buf);
+
+                if (!canPlay)
                     return -1;
 
                 const url = Module["SDL2Mixer"].createBlob(buf);
@@ -411,13 +513,14 @@ static void *MusicHTML5_CreateFromFile(const char *file)
             const buf = FS.readFile(file);
             url = Module["SDL2Mixer"].createBlob(buf);
 
-            let canPlay = force || Module["SDL2Mixer"].canPlayFile(file);
+            const canPlay = force 
+                || Module["SDL2Mixer"].canPlayFile(file)
+                || Module["SDL2Mixer"].canPlayMagic(buf);
 
-            if (!canPlay)
-                canPlay = Module["SDL2Mixer"].canPlayMagic(buf);
-
-            if (!canPlay)
+            if (!canPlay) {
+                Module["SDL2Mixer"].deleteBlob(url);
                 return -1;
+            }
         } catch(e) {
             // Fail silently, presume file not in FS.
             // Assume it's a relative or absolute URL
@@ -450,13 +553,13 @@ static void *MusicHTML5_CreateFromFile(const char *file)
 static void MusicHTML5_SetVolume(void *context, int volume)
 {
     MusicHTML5 *music = (MusicHTML5 *)context;
-    volume /= MIX_MAX_VOLUME;
+    float normalized_volume = ((float)volume) / MIX_MAX_VOLUME;
 
     EM_ASM({
         const id = $0;
         const volume = Math.min(Math.max(0, $1), 1);
-        Module["SDL2Mixer"].music[id].volume = volume;
-    }, music->id, volume);
+        Module["SDL2Mixer"].setPlayerVolume(id, volume);
+    }, music->id, normalized_volume);
 }
 
 static void MusicHTML5_Stop(void *context);
@@ -478,20 +581,20 @@ static int MusicHTML5_Play(void *context, int play_count)
             const id = $0;
             const playCount = $1;
 
-            // Retain play_count for handling in musicFinished()
-            Module["SDL2Mixer"].music[id].dataset.playCount = playCount;
-
-            // If play_count == -1, we are looping
-            Module["SDL2Mixer"].music[id].loop = (playCount == -1);
-
             // TODO: Asyncify Promise
-            const played = Module["SDL2Mixer"].music[id].play();
+            const played = Module["SDL2Mixer"].startPlayer(id);
 
             // Older browsers do not return a Promise
             if (played)
-                played.catch((e) => Module["printErr"](e));
+                played.catch((e) => err(e));
+
+            // Retain play_count for handling in musicFinished()
+            Module["SDL2Mixer"].setPlayerPlayCount(id, playCount);
+
+            // If play_count == -1, we are looping
+            Module["SDL2Mixer"].setPlayerLoop(id, (playCount == -1));
         } catch (e) {
-            Module["printErr"](e);
+            err(e);
             return -1;
         }
         return 0;
@@ -526,18 +629,19 @@ static SDL_bool MusicHTML5_IsPlaying(void *context)
     int safeStatus = EM_ASM_INT({
         const id = $0;
         const safeStatus =
-            Module["SDL2Mixer"].music[id]
-            && !Module["SDL2Mixer"].music[id].ended
+            Module["SDL2Mixer"].player
+            && Module["SDL2Mixer"].player.dataset.currentId == id
+            && !Module["SDL2Mixer"].player.ended
             // SDL Mixer considers "paused" music as "playing"
-            //&& !Module["SDL2Mixer"].music[id].paused
+            //&& !Module["SDL2Mixer"].player.paused
             // These conditions interfere with the "playing" check
-            //&&  Module["SDL2Mixer"].music[id].readyState > 2;
-            //&&  Module["SDL2Mixer"].music[id].currentTime > 0
+            //&&  Module["SDL2Mixer"].player.readyState > 2;
+            //&&  Module["SDL2Mixer"].player.currentTime > 0
             ;
 
         if (!safeStatus)
             // Reset JS state and falsify music->playing
-            Module["SDL2Mixer"].resetMusicState(Module["SDL2Mixer"].music[id]);
+            Module["SDL2Mixer"].resetMusicState(id);
     }, music->id);
 
     return music->playing;
@@ -551,7 +655,7 @@ static int MusicHTML5_Seek(void *context, double time)
     EM_ASM({
         const id = $0;
         const time = $1;
-        Module["SDL2Mixer"].music[id].currentTime = time;
+        Module["SDL2Mixer"].setPlayerCurrentTime(id, time);
     }, music->id, time);
 
     return 0;
@@ -564,7 +668,7 @@ static void MusicHTML5_Pause(void *context)
 
     EM_ASM({
         const id = $0;
-        Module["SDL2Mixer"].music[id].pause();
+        Module["SDL2Mixer"].pausePlayer(id);
     }, music->id);
 }
 
@@ -575,7 +679,7 @@ static void MusicHTML5_Resume(void *context)
 
     EM_ASM({
         const id = $0;
-        Module["SDL2Mixer"].music[id].play();
+        Module["SDL2Mixer"].playPlayer(id);
     }, music->id);
 }
 
@@ -586,7 +690,7 @@ static void MusicHTML5_Stop(void *context)
 
     EM_ASM({
         const id = $0;
-        Module["SDL2Mixer"].resetMusicState(Module["SDL2Mixer"].music[id]);
+        Module["SDL2Mixer"].resetMusicState(id);
     }, music->id);
 }
 
@@ -616,10 +720,20 @@ static void MusicHTML5_Close(void)
 
     EM_ASM({
         for(const prop in Module["SDL2Mixer"].music) {
-            if (!(Module["SDL2Mixer"].music[prop] instanceof HTMLMediaElement))
-                continue;
             Module["SDL2Mixer"].deleteMusic(prop);
         }
+
+        Module["SDL2Mixer"].player.pause();
+        Module["SDL2Mixer"].player.removeAttribute("src");
+        Module["SDL2Mixer"].player.load();
+        Module["SDL2Mixer"].player.remove();
+
+        Module["SDL2Mixer"].player.removeEventListener("ended", Module["SDL2Mixer"].musicFinished, false);
+        Module["SDL2Mixer"].player.removeEventListener("error", Module["SDL2Mixer"].musicError, false);
+        Module["SDL2Mixer"].player.removeEventListener("abort", Module["SDL2Mixer"].musicInterrupted, false);
+        //Module["SDL2Mixer"].player.removeEventListener("stalled", Module["SDL2Mixer"].musicInterrupted, false);
+        //Module["SDL2Mixer"].player.removeEventListener("suspend", Module["SDL2Mixer"].musicInterrupted, false);
+
         delete Module["SDL2Mixer"];
     });
 }
