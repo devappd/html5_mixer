@@ -90,7 +90,12 @@ static int MusicHTML5_Open(const SDL_AudioSpec *spec)
             // Data
             ////////////////////////////////////////////////////////////
 
-            player: new Audio(),
+            player: (function() {
+                const newPlayer = new Audio();
+                // TODO: Make this configurable
+                newPlayer.crossOrigin = 'anonymous';
+                return newPlayer;
+            })(),
 
             blob: {
                 // URL.createObjectURL(...): numUses (int)
